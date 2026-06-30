@@ -1,0 +1,63 @@
+spring:
+  application:
+    name: wedding-archiver
+  datasource:
+    url: ${DB_URL:jdbc:mariadb://localhost:3306/wedding_archiver?createDatabaseIfNotExist=true&useUnicode=true&characterEncoding=UTF-8}
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:}
+    driver-class-name: org.mariadb.jdbc.Driver
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MariaDBDialect
+        format_sql: true
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+
+server:
+  port: ${SERVER_PORT:8080}
+
+archiver:
+  storage:
+    # Relative to JVM working directory; override with ARCHIVER_STORAGE_ROOT_PATH.
+    root-path: ${ARCHIVER_STORAGE_ROOT_PATH:./storage/archives}
+  http:
+    connect-timeout-millis: 10000
+    read-timeout-millis: 30000
+    user-agent: "WeddingArchiverBot/1.0 (+https://wedding-archiver.example.com)"
+    # 50 MB per asset, 500 MB per archive — adjust as needed.
+    max-asset-bytes: 52428800
+    max-total-bytes: 524288000
+  scrape:
+    allowed-schemes:
+      - http
+      - https
+    follow-redirects: true
+    max-redirects: 5
+    # Stylesheets need url(...) rewriting, so they get their own special path.
+    stylesheet-selector: "link[rel=stylesheet][href]"
+    # All other downloadable element/attribute pairs. Bytes are copied as-is.
+    asset-selectors:
+      "link[rel=icon][href]": href
+      "link[rel*=icon][href]": href
+      "link[rel=preload][href]": href
+      "link[rel=prefetch][href]": href
+      "link[rel=manifest][href]": href
+      "script[src]": src
+      "img[src]": src
+      "source[src]": src
+      "video[poster]": poster
+      "audio[src]": src
+    # Attributes treated as srcset (comma-separated url + descriptor lists).
+    srcset-selectors:
+      "img[srcset]": srcset
+      "source[srcset]": srcset
+
+logging:
+  level:
+    com.weddingarchiver: DEBUG
