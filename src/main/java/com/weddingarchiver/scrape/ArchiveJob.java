@@ -12,11 +12,13 @@ import java.security.NoSuchAlgorithmException;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.Map;
+import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import org.jsoup.Connection;
 import org.jsoup.Jsoup;
+import org.jsoup.nodes.DataNode;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
@@ -29,6 +31,22 @@ import com.weddingarchiver.scrape.AssetDownloader.DownloadedAsset;
 /**
  * Single archive operation. Holds the per-invocation dedup cache, running byte
  * total, and counters. Not thread-safe and not reusable across archives.
+ *
+ * <p>Layout produced:
+ * <pre>
+ *   {archiveDir}/index.html        ← rewritten page, references assets/ siblings
+ *   {archiveDir}/assets/{hash}.ext ← every downloaded asset, flat
+ * </pre>
+ *
+ * <p>Path rewriting is context-aware. Asset storage returns only the bare
+ * filename; the referrer decides the relative prefix:
+ * <ul>
+ *   <li>HTML at the archive root references assets as {@code assets/{file}}.</li>
+ *   <li>A stylesheet that itself lives in {@code assets/} references its own
+ *       assets as plain siblings {@code {file}} — both live in the same dir.</li>
+ * </ul>
+ * Getting this wrong yields {@code assets/assets/...} and breaks every CSS
+ * background image and @font-face, so the distinction is deliberate.
  */
 public class ArchiveJob {
 
@@ -43,7 +61,8 @@ public class ArchiveJob {
 	private final AssetDownloader downloader;
 	private final CssRewriter cssRewriter;
 
-	private final Map<URI, String> assetLocalPathCache = new HashMap<>();
+	/** URI → bare stored filename (location-independent). */
+	private final Map<URI, String> assetFilenameCache = new HashMap<>();
 	private long totalBytes;
 	private int assetCount;
 
@@ -88,7 +107,7 @@ public class ArchiveJob {
 		doc.setBaseUri(baseUri.toString());
 
 		// A <base href> in the source would change relative-path resolution in the
-		// archived copy; strip it so our local "./assets/..." paths work as-is.
+		// archived copy; strip it so our local "assets/..." paths work as-is.
 		doc.select("base[href]").remove();
 
 		rewriteStylesheets(doc);
@@ -116,51 +135,45 @@ public class ArchiveJob {
 		if (selector == null || selector.isBlank()) {
 			return;
 		}
-		Elements elements = doc.select(selector);
-		for (Element el : elements) {
-			String abs = el.absUrl("href");
-			URI uri = toUri(abs);
+		for (Element el : doc.select(selector)) {
+			URI uri = toUri(el.absUrl("href"));
 			if (uri == null) {
 				continue;
 			}
-			String localPath = processStylesheet(uri);
-			if (localPath != null) {
-				el.attr("href", localPath);
+			String filename = storeStylesheet(uri);
+			if (filename != null) {
+				el.attr("href", "assets/" + filename);
 			}
 		}
 	}
 
 	private void rewriteBinaryAssets(Document doc) {
-		for (Map.Entry<String, String> entry : props.scrape().assetSelectors().entrySet()) {
-			String selector = entry.getKey();
-			String attr = entry.getValue();
-			Elements elements = doc.select(selector);
-			for (Element el : elements) {
-				String abs = el.absUrl(attr);
-				URI uri = toUri(abs);
+		for (ArchiverProperties.SelectorRule rule : props.scrape().assetSelectors()) {
+			String selector = rule.selector();
+			String attr = rule.attribute();
+			for (Element el : doc.select(selector)) {
+				URI uri = toUri(el.absUrl(attr));
 				if (uri == null) {
 					continue;
 				}
-				String localPath = processBinaryAsset(uri);
-				if (localPath != null) {
-					el.attr(attr, localPath);
+				String filename = storeBinaryAsset(uri);
+				if (filename != null) {
+					el.attr(attr, "assets/" + filename);
 				}
 			}
 		}
 	}
 
 	private void rewriteSrcsets(Document doc) {
-		for (Map.Entry<String, String> entry : props.scrape().srcsetSelectors().entrySet()) {
-			String selector = entry.getKey();
-			String attr = entry.getValue();
-			Elements elements = doc.select(selector);
-			for (Element el : elements) {
+		for (ArchiverProperties.SelectorRule rule : props.scrape().srcsetSelectors()) {
+			String selector = rule.selector();
+			String attr = rule.attribute();
+			for (Element el : doc.select(selector)) {
 				String raw = el.attr(attr);
 				if (raw == null || raw.isBlank()) {
 					continue;
 				}
-				String rewritten = rewriteSrcset(raw, URI.create(el.baseUri()));
-				el.attr(attr, rewritten);
+				el.attr(attr, rewriteSrcset(raw, URI.create(el.baseUri())));
 			}
 		}
 	}
@@ -168,25 +181,25 @@ public class ArchiveJob {
 	private String rewriteSrcset(String srcset, URI baseUri) {
 		String[] entries = srcset.split(",");
 		StringBuilder out = new StringBuilder();
-		for (int i = 0; i < entries.length; i++) {
-			String trimmed = entries[i].trim();
+		for (String rawEntry : entries) {
+			String trimmed = rawEntry.trim();
 			if (trimmed.isEmpty()) {
 				continue;
 			}
 			String[] parts = trimmed.split("\\s+", 2);
 			String url = parts[0];
 			String descriptor = parts.length > 1 ? " " + parts[1] : "";
+			String replacement = url;
 			URI uri;
 			try {
 				uri = baseUri.resolve(url);
 			} catch (IllegalArgumentException e) {
 				uri = null;
 			}
-			String replacement = url;
 			if (uri != null && isAllowedScheme(uri)) {
-				String localPath = processBinaryAsset(uri);
-				if (localPath != null) {
-					replacement = localPath;
+				String filename = storeBinaryAsset(uri);
+				if (filename != null) {
+					replacement = "assets/" + filename;
 				}
 			}
 			if (out.length() > 0) {
@@ -198,44 +211,43 @@ public class ArchiveJob {
 	}
 
 	private void rewriteInlineStyles(Document doc, URI baseUri) {
-		Elements styles = doc.select("style");
-		for (Element style : styles) {
+		// <style> blocks live in the HTML at the archive root → "assets/" prefix.
+		for (Element style : doc.select("style")) {
 			String original = style.data();
 			if (original == null || original.isEmpty()) {
 				continue;
 			}
-			String rewritten = cssRewriter.rewrite(original, baseUri, this::resolveCssReference);
+			String rewritten = cssRewriter.rewrite(original, baseUri, this::resolveCssRefFromRoot);
 			if (!rewritten.equals(original)) {
 				style.text("");
-				style.appendChild(new org.jsoup.nodes.DataNode(rewritten));
+				style.appendChild(new DataNode(rewritten));
 			}
 		}
 
-		// Inline style="..." attributes may carry url() too.
-		Elements styled = doc.select("[style]");
-		for (Element el : styled) {
+		// Inline style="..." attributes also sit at the root.
+		for (Element el : doc.select("[style]")) {
 			String original = el.attr("style");
 			if (original == null || original.isEmpty()) {
 				continue;
 			}
-			String rewritten = cssRewriter.rewrite(original, baseUri, this::resolveCssReference);
+			String rewritten = cssRewriter.rewrite(original, baseUri, this::resolveCssRefFromRoot);
 			if (!rewritten.equals(original)) {
 				el.attr("style", rewritten);
 			}
 		}
 	}
 
-	private String processBinaryAsset(URI uri) {
+	/** Downloads (if new) and returns the bare local filename, or null on failure. */
+	private String storeBinaryAsset(URI uri) {
 		if (!isAllowedScheme(uri)) {
 			return null;
 		}
-		String cached = assetLocalPathCache.get(uri);
+		String cached = assetFilenameCache.get(uri);
 		if (cached != null) {
 			return cached;
 		}
 
 		String localName = buildLocalName(uri, "bin");
-		String relativePath = "assets/" + localName;
 		Path localFile = assetsDir.resolve(localName);
 
 		try {
@@ -247,8 +259,8 @@ public class ArchiveJob {
 			Files.write(localFile, asset.data());
 			totalBytes += asset.data().length;
 			assetCount++;
-			assetLocalPathCache.put(uri, relativePath);
-			return relativePath;
+			assetFilenameCache.put(uri, localName);
+			return localName;
 		} catch (IOException | InterruptedException e) {
 			if (e instanceof InterruptedException) {
 				Thread.currentThread().interrupt();
@@ -258,54 +270,58 @@ public class ArchiveJob {
 		}
 	}
 
-	private String processStylesheet(URI uri) {
+	/** Downloads a stylesheet, rewrites its url() refs as siblings, returns filename. */
+	private String storeStylesheet(URI uri) {
 		if (!isAllowedScheme(uri)) {
 			return null;
 		}
-		String cached = assetLocalPathCache.get(uri);
+		String cached = assetFilenameCache.get(uri);
 		if (cached != null) {
 			return cached;
 		}
 
 		String localName = buildLocalName(uri, "css");
-		String relativePath = "assets/" + localName;
 		Path localFile = assetsDir.resolve(localName);
 
 		// Reserve the cache entry up-front so @import cycles short-circuit instead
 		// of recursing forever (the file is written later in this same call).
-		assetLocalPathCache.put(uri, relativePath);
+		assetFilenameCache.put(uri, localName);
 
 		try {
 			DownloadedAsset asset = downloader.download(uri);
 			Charset cs = detectCssCharset(asset.contentType());
 			String css = new String(asset.data(), cs);
-			String rewritten = cssRewriter.rewrite(css, uri, this::resolveCssReference);
+			String rewritten = cssRewriter.rewrite(css, uri, this::resolveCssRefAsSibling);
 			byte[] outBytes = rewritten.getBytes(StandardCharsets.UTF_8);
 			if (totalBytes + outBytes.length > props.http().maxTotalBytes()) {
 				log.warn("Skipping stylesheet {} — would exceed max-total-bytes", uri);
-				assetLocalPathCache.remove(uri);
+				assetFilenameCache.remove(uri);
 				return null;
 			}
 			Files.write(localFile, outBytes);
 			totalBytes += outBytes.length;
 			assetCount++;
-			return relativePath;
+			return localName;
 		} catch (IOException | InterruptedException e) {
 			if (e instanceof InterruptedException) {
 				Thread.currentThread().interrupt();
 			}
 			log.warn("Failed to download stylesheet {}: {}", uri, e.toString());
-			assetLocalPathCache.remove(uri);
+			assetFilenameCache.remove(uri);
 			return null;
 		}
 	}
 
-	private String resolveCssReference(URI uri) {
+	/** url() inside an external stylesheet (which lives in assets/): sibling path. */
+	private String resolveCssRefAsSibling(URI uri) {
 		String path = uri.getPath() == null ? "" : uri.getPath().toLowerCase();
-		if (path.endsWith(".css")) {
-			return processStylesheet(uri);
-		}
-		return processBinaryAsset(uri);
+		return path.endsWith(".css") ? storeStylesheet(uri) : storeBinaryAsset(uri);
+	}
+
+	/** url() inside inline HTML styles (which live at the root): assets/ prefix. */
+	private String resolveCssRefFromRoot(URI uri) {
+		String filename = resolveCssRefAsSibling(uri);
+		return filename == null ? null : "assets/" + filename;
 	}
 
 	private boolean isAllowedScheme(URI uri) {
@@ -348,22 +364,22 @@ public class ArchiveJob {
 		return hash + "." + ext;
 	}
 
-	private java.util.Optional<String> extractExtension(URI uri) {
+	private Optional<String> extractExtension(URI uri) {
 		String path = uri.getPath();
 		if (path == null || path.isBlank()) {
-			return java.util.Optional.empty();
+			return Optional.empty();
 		}
 		int slash = path.lastIndexOf('/');
 		String name = slash >= 0 ? path.substring(slash + 1) : path;
 		int dot = name.lastIndexOf('.');
 		if (dot < 0 || dot >= name.length() - 1) {
-			return java.util.Optional.empty();
+			return Optional.empty();
 		}
 		String ext = name.substring(dot + 1).toLowerCase().replaceAll("[^a-z0-9]", "");
 		if (ext.isEmpty() || ext.length() > 8) {
-			return java.util.Optional.empty();
+			return Optional.empty();
 		}
-		return java.util.Optional.of(ext);
+		return Optional.of(ext);
 	}
 
 	private Charset detectCssCharset(String contentType) {
@@ -375,7 +391,7 @@ public class ArchiveJob {
 			try {
 				return Charset.forName(m.group(1));
 			} catch (Exception ignored) {
-				// fall through
+				// fall through to UTF-8
 			}
 		}
 		return StandardCharsets.UTF_8;

@@ -2,7 +2,6 @@ package com.weddingarchiver.config;
 
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Map;
 
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
@@ -28,7 +27,16 @@ public record ArchiverProperties(
 			boolean followRedirects,
 			int maxRedirects,
 			String stylesheetSelector,
-			Map<String, String> assetSelectors,
-			Map<String, String> srcsetSelectors) {
+			List<SelectorRule> assetSelectors,
+			List<SelectorRule> srcsetSelectors) {
+	}
+
+	/**
+	 * A CSS selector paired with the attribute that carries the asset URL. Modeled
+	 * as a list element rather than a map entry because the selectors contain
+	 * {@code [...]} brackets, which Spring Boot's relaxed binding would otherwise
+	 * mangle if they appeared as property-map keys.
+	 */
+	public record SelectorRule(String selector, String attribute) {
 	}
 }

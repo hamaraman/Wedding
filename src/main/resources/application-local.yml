@@ -1,0 +1,22 @@
+# Local smoke-test profile: in-memory H2 instead of MariaDB.
+# Activate with: ./gradlew bootRun --args='--spring.profiles.active=local'
+# Nothing here is used in production — the default profile still targets MariaDB.
+# Port 8081 because 8080 is taken by another local WAS on this machine.
+server:
+  port: 8081
+spring:
+  datasource:
+    url: jdbc:h2:mem:wedding;DB_CLOSE_DELAY=-1;MODE=MySQL
+    driver-class-name: org.h2.Driver
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.H2Dialect
+  h2:
+    console:
+      enabled: true
+      path: /h2-console

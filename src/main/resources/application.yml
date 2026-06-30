@@ -42,21 +42,35 @@ archiver:
     # Stylesheets need url(...) rewriting, so they get their own special path.
     stylesheet-selector: "link[rel=stylesheet][href]"
     # All other downloadable element/attribute pairs. Bytes are copied as-is.
+    # A list (not a map) because CSS selectors contain [...] brackets that
+    # Spring Boot's relaxed binding mangles when used as property-map keys.
     asset-selectors:
-      "link[rel=icon][href]": href
-      "link[rel*=icon][href]": href
-      "link[rel=preload][href]": href
-      "link[rel=prefetch][href]": href
-      "link[rel=manifest][href]": href
-      "script[src]": src
-      "img[src]": src
-      "source[src]": src
-      "video[poster]": poster
-      "audio[src]": src
+      - selector: "link[rel=icon][href]"
+        attribute: href
+      - selector: "link[rel*=icon][href]"
+        attribute: href
+      - selector: "link[rel=preload][href]"
+        attribute: href
+      - selector: "link[rel=prefetch][href]"
+        attribute: href
+      - selector: "link[rel=manifest][href]"
+        attribute: href
+      - selector: "script[src]"
+        attribute: src
+      - selector: "img[src]"
+        attribute: src
+      - selector: "source[src]"
+        attribute: src
+      - selector: "video[poster]"
+        attribute: poster
+      - selector: "audio[src]"
+        attribute: src
     # Attributes treated as srcset (comma-separated url + descriptor lists).
     srcset-selectors:
-      "img[srcset]": srcset
-      "source[srcset]": srcset
+      - selector: "img[srcset]"
+        attribute: srcset
+      - selector: "source[srcset]"
+        attribute: srcset
 
 logging:
   level:
